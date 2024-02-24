@@ -3103,6 +3103,11 @@
             "xci_name": "design_1_rdmx_xmit_0_0",
             "xci_path": "ip/design_1_rdmx_xmit_0_0/design_1_rdmx_xmit_0_0.xci",
             "inst_hier_path": "rdmx_xmit/rdmx_xmit",
+            "parameters": {
+              "FIFO_CLOCK_MODE": {
+                "value": "common_clock"
+              }
+            },
             "reference_info": {
               "ref_type": "hdl",
               "ref_name": "rdmx_xmit",
@@ -3469,16 +3474,16 @@
               }
             },
             "ports": {
-              "clk": {
+              "src_clk": {
                 "type": "clk",
                 "direction": "I",
                 "parameters": {
-                  "ASSOCIATED_BUSIF": {
-                    "value": "AXIS_TX:S_AXI",
+                  "ASSOCIATED_RESET": {
+                    "value": "src_resetn",
                     "value_src": "constant"
                   },
-                  "ASSOCIATED_RESET": {
-                    "value": "resetn",
+                  "ASSOCIATED_BUSIF": {
+                    "value": "S_AXI",
                     "value_src": "constant"
                   },
                   "FREQ_HZ": {
@@ -3491,13 +3496,31 @@
                   }
                 }
               },
-              "resetn": {
+              "src_resetn": {
                 "type": "rst",
                 "direction": "I",
                 "parameters": {
                   "POLARITY": {
                     "value": "ACTIVE_LOW",
                     "value_src": "constant"
+                  }
+                }
+              },
+              "dst_clk": {
+                "type": "clk",
+                "direction": "I",
+                "parameters": {
+                  "ASSOCIATED_BUSIF": {
+                    "value": "AXIS_TX",
+                    "value_src": "constant"
+                  },
+                  "FREQ_HZ": {
+                    "value": "250000000",
+                    "value_src": "user_prop"
+                  },
+                  "CLK_DOMAIN": {
+                    "value": "design_1_xdma_0_0_axi_aclk",
+                    "value_src": "default_prop"
                   }
                 }
               },
@@ -3528,7 +3551,8 @@
             "ports": [
               "clk",
               "rdmx_ila/clk",
-              "rdmx_xmit/clk"
+              "rdmx_xmit/dst_clk",
+              "rdmx_xmit/src_clk"
             ]
           },
           "packet_data_fifo_full": {
@@ -3541,7 +3565,7 @@
             "ports": [
               "resetn",
               "rdmx_ila/resetn",
-              "rdmx_xmit/resetn"
+              "rdmx_xmit/src_resetn"
             ]
           }
         }

@@ -27,33 +27,32 @@
     <>     12 bytes of reserved data, always 0                                      <>
     <><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><>
 
-    The incoming AXI data should be byte packed; only the last beat (the beat with
-    S_AXI_WLAST asserted) may have a WSTRB bits set to 0.
+    The incoming AXIS_DATA data should be byte packed; only the last beat (the beat with
+    AXIS_DATA_TLAST asserted) may have a TKEEP bits set to 0.
     
     Notable busses:
 
-        S_AXI AW-channel feeds the input of the rdmx-header FIFO
-        S_AXI W-channel feeds the input of the packet-data FIFO
-        fplin feeds the input of the packet-length FIFO
+        AXIS_DATA feeds the input of the packet-data FIFO
+        AXIS_PLEN feeds the input of the packet-length FIFO
+        AXIS_ADDR feeds the input of the target-address FIFO
 
-        fplout is the output of the packet-length FIFO
         fpdout is the output of the packet-data FIFO
-        ftaout is the output of the rdmx-header FIFO
+        fplout is the output of the packet-length FIFO
+        ftaout is the output of the target-address FIFO
 
 */
-module rdmx_xmit # 
+module rdmx_xmit_be # 
 (
-    // This is the width of the incoming and outgoing data bus in bytes
-    parameter STREAM_WBYTS = 64,      
+    // This can be either "common_clock" or "independent clock".   Use
+    // "independent clock" if the two clock inputs are not being fed 
+    // from the same clock source!
+    parameter FIFO_CLOCK_MODE = "independent_clock",
 
-    // This width of the incoming and outgoing data bus in bits
-    parameter STREAM_WBITS = STREAM_WBYTS * 8,
-
-    // Width of an AXI address in bytes
-    parameter ADDR_WBYTS = 8,
+    // This is the width of the incoming and outgoing data bus in bits
+    parameter DATA_WBITS = 512,
 
     // Width of an AXI address in bits
-    parameter ADDR_WBITS = ADDR_WBYTS * 8,
+    parameter ADDR_WBITS = 64,
 
     // Last octet of the source MAC address
     parameter[ 7:0] SRC_MAC = 2,    
@@ -84,99 +83,114 @@ module rdmx_xmit #
     // This should be at minimum MAX_PACKET_COUNT * # of data-cycles in the smallest
     // incoming packet.  This number must be large enough to accomodate the number of
     // data cycles in the largest incoming packet.
-    parameter DATA_FIFO_SIZE = 256
+    parameter DATA_FIFO_DEPTH = 256
 
     //<><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><>
-    //>> DATA_FIFO_SIZE / MAX_PACKET_COUNT = # of cycles in the smallest incoming data packet
+    //>> DATA_FIFO_DEPTH / MAX_PACKET_COUNT = # of cycles in the smallest incoming data packet
     //<><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><>
 ) 
 (
-    input clk, resetn,
+    (* X_INTERFACE_INFO      = "xilinx.com:signal:clock:1.0 src_clk CLK" *)
+    (* X_INTERFACE_PARAMETER = "ASSOCIATED_BUSIF AXIS_PLEN:AXIS_ADDR:AXIS_DATA, ASSOCIATED_RESET src_resetn" *)
+    input src_clk,
+    input src_resetn,
+
+
+    (* X_INTERFACE_INFO      = "xilinx.com:signal:clock:1.0 dst_clk CLK" *)
+    (* X_INTERFACE_PARAMETER = "ASSOCIATED_BUSIF AXIS_TX" *)
+    input dst_clk,
     
-   //=================  This is the main AXI4-slave interface  ================
-    
-    // "Specify write address"              -- Master --    -- Slave --
-    input[ADDR_WBITS-1:0]                   S_AXI_AWADDR,
-    input                                   S_AXI_AWVALID,
-    input[3:0]                              S_AXI_AWID,
-    input[7:0]                              S_AXI_AWLEN,
-    input[2:0]                              S_AXI_AWSIZE,
-    input[1:0]                              S_AXI_AWBURST,
-    input                                   S_AXI_AWLOCK,
-    input[3:0]                              S_AXI_AWCACHE,
-    input[3:0]                              S_AXI_AWQOS,
-    input[2:0]                              S_AXI_AWPROT,
-    output                                                  S_AXI_AWREADY,
-
-    // "Write Data"                         -- Master --    -- Slave --
-    input[STREAM_WBITS-1:0]                 S_AXI_WDATA,
-    input[STREAM_WBYTS-1:0]                 S_AXI_WSTRB,
-    input                                   S_AXI_WVALID,
-    input                                   S_AXI_WLAST,
-    output                                                  S_AXI_WREADY,
-
-    // "Send Write Response"                -- Master --    -- Slave --
-    output[1:0]                                             S_AXI_BRESP,
-    output                                                  S_AXI_BVALID,
-    input                                   S_AXI_BREADY,
-
-    // "Specify read address"               -- Master --    -- Slave --
-    input[ADDR_WBITS-1:0]                   S_AXI_ARADDR,
-    input                                   S_AXI_ARVALID,
-    input[2:0]                              S_AXI_ARPROT,
-    input                                   S_AXI_ARLOCK,
-    input[3:0]                              S_AXI_ARID,
-    input[7:0]                              S_AXI_ARLEN,
-    input[1:0]                              S_AXI_ARBURST,
-    input[3:0]                              S_AXI_ARCACHE,
-    input[3:0]                              S_AXI_ARQOS,
-    output                                                  S_AXI_ARREADY,
-
-    // "Read data back to master"           -- Master --    -- Slave --
-    output[STREAM_WBITS-1:0]                                S_AXI_RDATA,
-    output                                                  S_AXI_RVALID,
-    output[1:0]                                             S_AXI_RRESP,
-    output                                                  S_AXI_RLAST,
-    input                                   S_AXI_RREADY,
-
+    //==========================================================================
+    //             Packet-length input stream, synchronous to src_clk
+    //==========================================================================
+    input  [15:0]           AXIS_PLEN_TDATA,
+    input                   AXIS_PLEN_TVALID,
+    output                  AXIS_PLEN_TREADY,
     //==========================================================================
 
-    
-    //========================  The outgoing UDP packet  =======================
-    output [STREAM_WBITS-1:0] AXIS_TX_TDATA,
-    output [STREAM_WBYTS-1:0] AXIS_TX_TKEEP,
-    output                    AXIS_TX_TVALID,
+    //==========================================================================
+    //           Target address input stream, synchronous to src_clk
+    //==========================================================================
+    input  [ADDR_WBITS-1:0] AXIS_ADDR_TDATA,
+    input                   AXIS_ADDR_TVALID,
+    output                  AXIS_ADDR_TREADY,
+    //==========================================================================
+
+
+    //==========================================================================
+    //              Packet-data input stream, synchronous to src_clk
+    //==========================================================================
+    input  [DATA_WBITS-1:0] AXIS_DATA_TDATA,
+    input                   AXIS_DATA_TLAST,
+    input                   AXIS_DATA_TVALID,
+    output                  AXIS_DATA_TREADY,
+    //==========================================================================
+
+
+    //==========================================================================
+    //     Outgoing UDP/RDMX packet, synchronous to dst_clk
+    //==========================================================================
+    output [DATA_WBITS-1:0]   AXIS_TX_TDATA,
+    output [DATA_WBITS/8-1:0] AXIS_TX_TKEEP,
     output                    AXIS_TX_TLAST,
+    output                    AXIS_TX_TVALID,
     input                     AXIS_TX_TREADY,
     //==========================================================================
 
-    // This is high whenever S_AXI is trying to write to a full FIFO
+    // This is high whenever AXIS_DATA is trying to write to a full FIFO
     output packet_data_fifo_full
 );
 
+// anding a packet length with this mask will give the the remainder
+// of "payload_length / width-of-the-data-bus-in-bytes"
+localparam REMAINDER_MASK = (1 << $clog2(DATA_WBITS/8)) - 1;
+
+//=============================================================================
+// This synchronizes src_resetn to dst_clk, resulting in dst_resetn
+//=============================================================================
+wire dst_resetn;
+xpm_cdc_async_rst #
+(
+    .DEST_SYNC_FF(4),
+    .INIT_SYNC_FF(0),
+    .RST_ACTIVE_HIGH(0)
+)
+reset_synchronizer
+(
+    .src_arst (src_resetn),    
+    .dest_arst(dst_resetn), 
+    .dest_clk (dst_clk   )   
+);
+//=============================================================================
+
+
 //==================  The output of the packet-data FIFO  ==================
-wire[STREAM_WBITS-1:0] fpdout_tdata;
-wire[STREAM_WBYTS-1:0] fpdout_tkeep;
+wire[DATA_WBITS-1:0]   fpdout_tdata;
 wire                   fpdout_tvalid;
 wire                   fpdout_tlast;
 wire                   fpdout_tready;
 //==========================================================================
 
 
-//=============  This feeds the input of the packet-length FIFO  ===========
-wire[15:0] fplin_tdata;
-wire       fplin_tvalid;
-wire       fplin_tready;
-//==========================================================================
-
 //=============  This is the output of the packet-length FIFO  =============
+reg [15:0] fplout_tdata_latched;
 wire[15:0] fplout_tdata;
 wire       fplout_tvalid;
 wire       fplout_tready;
 //==========================================================================
 
-// The number of bytes in the RDMX header fields that we care about
-localparam RDMX_HDR_FLDS = 8; 
+
+// This is the length of the payload data as reported by AXIS_PLEN
+wire[15:0] payload_length = (fplout_tvalid & fplout_tready) ? fplout_tdata : fplout_tdata_latched;
+
+
+//============  This is the output of the target-address FIFO  =============
+reg [ADDR_WBITS-1:0] ftaout_tdata_latched;
+wire[ADDR_WBITS-1:0] ftaout_tdata;
+wire                 ftaout_tvalid;
+reg                  ftaout_tready;
+//==========================================================================
+
 
 // The length (in bytes) of a standard header for an IP packet
 localparam IP_HDR_LEN = 20;
@@ -217,8 +231,8 @@ localparam[15:0] rdmx_magic = 16'h0122;
 localparam[12*8-1:0] rdmx_reserved   = 0;
 
 // Compute both the IPv4 packet length and UDP packet length
-wire[15:0]       ip4_length     = IP_HDR_LEN  + UDP_HDR_LEN + RDMX_HDR_LEN + fplout_tdata;
-wire[15:0]       udp_length     =               UDP_HDR_LEN + RDMX_HDR_LEN + fplout_tdata;
+wire[15:0]       ip4_length     = IP_HDR_LEN + UDP_HDR_LEN + RDMX_HDR_LEN + payload_length;
+wire[15:0]       udp_length     =              UDP_HDR_LEN + RDMX_HDR_LEN + payload_length;
 
 // Compute the 32-bit version of the IPv4 header checksum
 wire[31:0] ip4_cs32 = ip4_ver_dsf
@@ -234,21 +248,13 @@ wire[31:0] ip4_cs32 = ip4_ver_dsf
 // Compute the 16-bit IPv4 checksum
 wire[15:0] ip4_checksum = ~(ip4_cs32[15:0] + ip4_cs32[31:16]);
 
-// Fields for the RDMX header
-wire[8 *8-1:0] rdmx_target_addr; 
 
-// This is the output bus of RDMX header fields FIFO
-reg [RDMX_HDR_FLDS*8-1:0] rdmx_hdr_fields;
-wire[RDMX_HDR_FLDS*8-1:0] frhout_tdata;
-wire                      frhout_tvalid;
-reg                       frhout_tready;
-
-// Extract the target address from the RDMX header fields that we have
-// buffered up in a FIFO
-assign rdmx_target_addr = (frhout_tready & frhout_tvalid) ? frhout_tdata : rdmx_hdr_fields;
+// This is the target address of this outgoing packet
+wire[ADDR_WBITS-1:0] rdmx_target_addr = (ftaout_tready & ftaout_tvalid) ?
+                                        ftaout_tdata : ftaout_tdata_latched;
 
 // This is the 64-byte packet header for an RDMX packet
-wire[STREAM_WBITS-1:0] pkt_header =
+wire[DATA_WBITS-1:0] pkt_header =
 {
     // Ethernet header fields - 14 bytes
     eth_dst_mac,
@@ -283,12 +289,15 @@ wire[STREAM_WBITS-1:0] pkt_header =
 // The Ethernet IP sends the bytes from least-sigificant-byte to most-significant-byte.  
 // This means we need to create a little-endian (i.e., reversed) version of our packet 
 // header.
-wire[STREAM_WBITS-1:0] pkt_header_le;
+wire[DATA_WBITS-1:0] pkt_header_le;
 genvar i;
-for (i=0; i<STREAM_WBYTS; i=i+1) begin
-    assign pkt_header_le[i*8 +:8] = pkt_header[(STREAM_WBYTS-1-i)*8 +:8];
+for (i=0; i<(DATA_WBITS/8); i=i+1) begin
+    assign pkt_header_le[i*8 +:8] = pkt_header[(DATA_WBITS/8-1-i)*8 +:8];
 end 
 
+// Determine how many "leftover" bytes there are after dividing
+// payload_length by DATA_WBITS
+wire[ 7:0] extra_bytes  = (payload_length & REMAINDER_MASK);
 
 //=====================================================================================================================
 // In state 1, we drive AXIS_TX with the outgoing RDMX header.
@@ -298,11 +307,10 @@ assign AXIS_TX_TDATA = (fsm_state == 1) ? pkt_header_le
                      : (fsm_state == 2) ? fpdout_tdata
                      : 0;
 
-assign AXIS_TX_TKEEP = (fsm_state == 1) ? -1
-                     : (fsm_state == 2) ? fpdout_tkeep
-                     : 0;
-
 assign AXIS_TX_TLAST = (fsm_state == 2 & fpdout_tlast);
+
+assign AXIS_TX_TKEEP = (AXIS_TX_TLAST & (extra_bytes != 0)) ? (1 << extra_bytes)-1 : -1;
+
 
 assign AXIS_TX_TVALID = (fsm_state == 1) ? (fplout_tvalid & fplout_tready)
                       : (fsm_state == 2) ? fpdout_tvalid
@@ -311,17 +319,15 @@ assign AXIS_TX_TVALID = (fsm_state == 1) ? (fplout_tvalid & fplout_tready)
 assign fpdout_tready  = (fsm_state == 2 & AXIS_TX_TREADY);
 //=====================================================================================================================
 
-
 // This goes high to indicate that the packet data FIFO is full
-assign packet_data_fifo_full = S_AXI_WVALID & ~S_AXI_WREADY;
-
+assign packet_data_fifo_full = AXIS_DATA_TVALID & ~AXIS_DATA_TREADY;
 
 //=====================================================================================================================
 // This state machine has 3 states:
 //
 //   0 = We just came out of reset.  This state initializes things.
 //
-//   1 = Waiting for a "packet length" to arrive on AXIS_LEN.  When it does, the RDMX header is emitted
+//   1 = Waiting for a "packet length" to arrive on AXIS_PLEN.  When it does, the RDMX header is emitted
 //       on AXIS_TX.
 //
 //   2 = Copying the output of the packet-data FIFO to the AXIS_TX output stream
@@ -333,48 +339,49 @@ assign packet_data_fifo_full = S_AXI_WVALID & ~S_AXI_WREADY;
 //=====================================================================================================================
 
 // We are able to receive data from AXIS_LEN in state 1 only when the TX bus is ready for us to send
-assign fplout_tready = (resetn == 1 & fsm_state == 1 & AXIS_TX_TREADY);
+assign fplout_tready = (dst_resetn == 1 & fsm_state == 1 & AXIS_TX_TREADY);
 
-always @(posedge clk) begin
-    if (resetn == 0) begin
-        frhout_tready  <= 0;
+always @(posedge dst_clk) begin
+    if (dst_resetn == 0) begin
+        ftaout_tready  <= 0;
         fsm_state      <= 0;
     
     end else case(fsm_state) 
         
         // Here we're coming out of reset
         0:  begin
-                frhout_tready <= 1;
+                ftaout_tready <= 1;
                 fsm_state     <= 1;
             end
 
 
         // Here we're waiting for a packet-length to arrive on the fplout bus.  While
-        // we're waiting, we will capture the first data-cycle of rdmx-header FIFO
+        // we're waiting, we will capture the first data-cycle of target-address FIFO
         1:  begin
 
-                // While we're waiting for data to arrive on AXIS_LEN, read the
-                // first cycle of target-address from its FIFO.  We can use the 
-                // state of "frhout_tready" to determine whether target-address
-                // is sitting in rdmx_hdr_fields or in frhout_tdata.
+                // While we're waiting for data to arrive on AXIS_PLEN, read the
+                // first cycle of target-address from its FIFO. 
                 //
                 // The target address could arrive on the same data-cycle as the
                 // packet-length, or it could arrive earlier.
-                if (frhout_tready & frhout_tvalid) begin
-                    rdmx_hdr_fields <= frhout_tdata;
-                    frhout_tready   <= 0;                     
+                if (ftaout_tready & ftaout_tvalid) begin
+                    ftaout_tdata_latched <= ftaout_tdata;
+                    ftaout_tready        <= 0;                     
                 end
 
 
                 // If a packet-length arrives, the RDMX packet header is immediately
                 // emitted, and we go to state 2 to wait for the packet to complete
-                if (fplout_tready & fplout_tvalid) fsm_state <= 2;
+                if (fplout_tready & fplout_tvalid) begin
+                    fplout_tdata_latched <= fplout_tdata;
+                    fsm_state            <= 2;
+                end
             end
 
 
         // When we receive the last data-cycle of the packet, go back to state 1
         2:  if (fpdout_tvalid & fpdout_tready & fpdout_tlast) begin
-                frhout_tready <= 1;
+                ftaout_tready <= 1;
                 fsm_state     <= 1;
             end
         
@@ -384,143 +391,49 @@ end
 
 
 
-//=====================================================================================================================
-// This block counts the number of one bits in S_AXI_WSTRB, thereby determining the number of data-bytes in the
-// S_AXI_WDATA field. 
-//=====================================================================================================================
-reg[7:0] data_byte_count;
-//---------------------------------------------------------------------------------------------------------------------
-integer n;
-always @*
-begin
-    data_byte_count = 0;  
-    for (n=0;n<64;n=n+1) begin   
-        data_byte_count = data_byte_count + S_AXI_WSTRB[n];
-    end
-end
-//=====================================================================================================================
-
-
-//=====================================================================================================================
-// This state machine writes entries to the packet-length FIFO
-//=====================================================================================================================
-reg[15:0] packet_size;
-//---------------------------------------------------------------------------------------------------------------------
-
-// fplin_tdata contains the measured length of the incoming data packet
-assign fplin_tdata = packet_size + data_byte_count;
-
-// fplin_tdata is valid on the cycle where we see TLAST on the incoming data packet
-assign fplin_tvalid = (S_AXI_WVALID & S_AXI_WREADY & S_AXI_WLAST);
-
-always @(posedge clk) begin
-    if (resetn == 0) begin
-        packet_size <= 0;
-    end else begin
-        
-        // On every beat of incoming packet data, accumulate the packet-length.
-        // When we see the last beat of the packet, write the packet-length to the FIFO
-        if (S_AXI_WVALID & S_AXI_WREADY) begin
-            if (S_AXI_WLAST == 0)
-                packet_size <= packet_size + data_byte_count;
-            else 
-                packet_size <= 0;
-        end
-    end
-end
-//=====================================================================================================================
-
-
-// The number of AXI write transactions received, and the number of transactions responded to
-reg[63:0] transactions_rcvd, transactions_resp;
-
-//====================================================================================
-// This state machine counts the number of AXI write transactions received.
-//
-// Drives:
-//    transactions_rcvd
-//====================================================================================
-always @(posedge clk) begin
-    
-    // If we're in reset...
-    if (resetn == 0)
-        transactions_rcvd <= 0;
-    
-    // Otherwise, if this is the last beat of a burst...
-    else if (S_AXI_WVALID & S_AXI_WREADY & S_AXI_WLAST)
-        transactions_rcvd <= transactions_rcvd + 1;
-end
-//====================================================================================
-
-
-
-//====================================================================================
-// This state machine ensures that we issue an AXI response for each AXI transaction
-// that we receive.
-//
-// Drives:
-//    S_AXI_BVALID
-//    transactions_resp
-//====================================================================================
-
-// Our BRESP response is always "OKAY"
-assign S_AXI_BRESP = 0;
-
-// Our BRESP output is valid so long as we have transactions we haven't responsed to
-assign S_AXI_BVALID = (resetn == 1 && transactions_resp < transactions_rcvd);
-
-// Every time we see a valid handshake on the B-channel, it means that
-// we have successfully responded to an AXI write transaction
-always @(posedge clk) begin
-    if (resetn == 0) 
-        transactions_resp <= 0;
-    else if (S_AXI_BVALID & S_AXI_BREADY)
-        transactions_resp <= transactions_resp + 1;
-end
-//====================================================================================
-
-
 
 //====================================================================================
 // This FIFO holds the incoming packet data
 //====================================================================================
 xpm_fifo_axis #
 (
-   .FIFO_DEPTH(DATA_FIFO_SIZE),    // DECIMAL
-   .TDATA_WIDTH(STREAM_WBITS),     // DECIMAL
-   .FIFO_MEMORY_TYPE("auto"),      // String
-   .PACKET_FIFO("false"),          // String
-   .USE_ADV_FEATURES("0000")       // String
+   .FIFO_DEPTH      (DATA_FIFO_DEPTH), 
+   .TDATA_WIDTH     (DATA_WBITS),     
+   .FIFO_MEMORY_TYPE("auto"),       
+   .PACKET_FIFO     ("false"),      
+   .USE_ADV_FEATURES("0000"),        
+   .CDC_SYNC_STAGES (2),            
+   .CLOCKING_MODE   (FIFO_CLOCK_MODE)
+
 )
 packet_data_fifo
 (
     // Clock and reset
-   .s_aclk   (clk   ),                       
-   .m_aclk   (clk   ),             
-   .s_aresetn(resetn),
+   .s_aclk   (src_clk   ),                       
+   .m_aclk   (dst_clk   ),             
+   .s_aresetn(src_resetn),
 
-    // The input bus to the FIFO is the "W" channel of the AXI interface
-   .s_axis_tdata (S_AXI_WDATA ),
-   .s_axis_tkeep (S_AXI_WSTRB ),
-   .s_axis_tvalid(S_AXI_WVALID),
-   .s_axis_tlast (S_AXI_WLAST ),
-   .s_axis_tready(S_AXI_WREADY),
+    // The input bus to the FIFO is the AXIS_DATA input stream
+   .s_axis_tdata (AXIS_DATA_TDATA ),
+   .s_axis_tvalid(AXIS_DATA_TVALID),
+   .s_axis_tlast (AXIS_DATA_TLAST ),
+   .s_axis_tready(AXIS_DATA_TREADY),
 
     // The output bus of the FIFO
    .m_axis_tdata (fpdout_tdata ),     
-   .m_axis_tkeep (fpdout_tkeep ),
    .m_axis_tvalid(fpdout_tvalid),       
    .m_axis_tlast (fpdout_tlast ),         
    .m_axis_tready(fpdout_tready),
 
-
     // Unused input stream signals
+   .s_axis_tkeep(),
    .s_axis_tdest(),
    .s_axis_tid  (),
    .s_axis_tstrb(),
    .s_axis_tuser(),
 
     // Unused output stream signals
+   .m_axis_tkeep(),
    .m_axis_tdest(),             
    .m_axis_tid  (),               
    .m_axis_tstrb(), 
@@ -546,23 +459,25 @@ packet_data_fifo
 //====================================================================================
 xpm_fifo_axis #
 (
-   .FIFO_DEPTH(MAX_PACKET_COUNT),  // DECIMAL
-   .TDATA_WIDTH(16),               // DECIMAL
-   .FIFO_MEMORY_TYPE("auto"),      // String
-   .PACKET_FIFO("false"),          // String
-   .USE_ADV_FEATURES("0000")       // String
+   .FIFO_DEPTH      (MAX_PACKET_COUNT),  
+   .TDATA_WIDTH     (16),               
+   .FIFO_MEMORY_TYPE("auto"),       
+   .PACKET_FIFO     ("false"),      
+   .USE_ADV_FEATURES("0000"),        
+   .CDC_SYNC_STAGES (2),            
+   .CLOCKING_MODE   (FIFO_CLOCK_MODE)
 )
 packet_length_fifo
 (
     // Clock and reset
-   .s_aclk   (clk   ),                       
-   .m_aclk   (clk   ),             
-   .s_aresetn(resetn),
+   .s_aclk   (src_clk   ),                       
+   .m_aclk   (dst_clk   ),             
+   .s_aresetn(src_resetn),
 
-    // The input bus to the FIFO
-   .s_axis_tdata (fplin_tdata ),
-   .s_axis_tvalid(fplin_tvalid),
-   .s_axis_tready(fplin_tready),
+    // The input bus to the FIFO comes straight from the AXIS_PLEN input stream
+   .s_axis_tdata (AXIS_PLEN_TDATA ),
+   .s_axis_tvalid(AXIS_PLEN_TVALID),
+   .s_axis_tready(AXIS_PLEN_TREADY),
 
     // The output bus of the FIFO
    .m_axis_tdata (fplout_tdata ),     
@@ -605,28 +520,30 @@ packet_length_fifo
 //====================================================================================
 xpm_fifo_axis #
 (
-   .FIFO_DEPTH(MAX_PACKET_COUNT),   // DECIMAL
-   .TDATA_WIDTH(RDMX_HDR_FLDS*8),   // DECIMAL
-   .FIFO_MEMORY_TYPE("auto"),       // String
-   .PACKET_FIFO("false"),           // String
-   .USE_ADV_FEATURES("0000")        // String
+   .FIFO_DEPTH      (MAX_PACKET_COUNT),   
+   .TDATA_WIDTH     (ADDR_WBITS),        
+   .FIFO_MEMORY_TYPE("auto"),       
+   .PACKET_FIFO     ("false"),      
+   .USE_ADV_FEATURES("0000"),        
+   .CDC_SYNC_STAGES (2),            
+   .CLOCKING_MODE   (FIFO_CLOCK_MODE)
 )
-rdmx_hdr_fifo
+rdmx_addr_fifo
 (
     // Clock and reset
-   .s_aclk   (clk   ),                       
-   .m_aclk   (clk   ),             
-   .s_aresetn(resetn),
+   .s_aclk   (src_clk   ),                       
+   .m_aclk   (dst_clk   ),             
+   .s_aresetn(src_resetn),
 
-    // The input of this FIFO is wired directly the AW channel of the AXI interface
-   .s_axis_tdata (S_AXI_AWADDR ),
-   .s_axis_tvalid(S_AXI_AWVALID),
-   .s_axis_tready(S_AXI_AWREADY),
+    // The input of this FIFO comes from the AXIS_ADDR stream
+   .s_axis_tdata (AXIS_ADDR_TDATA ),
+   .s_axis_tvalid(AXIS_ADDR_TVALID),
+   .s_axis_tready(AXIS_ADDR_TREADY),
 
     // The output bus of the FIFO
-   .m_axis_tdata (frhout_tdata ),     
-   .m_axis_tvalid(frhout_tvalid),       
-   .m_axis_tready(frhout_tready),     
+   .m_axis_tdata (ftaout_tdata ),     
+   .m_axis_tvalid(ftaout_tvalid),       
+   .m_axis_tready(ftaout_tready),     
 
     // Unused input stream signals
    .s_axis_tdest(),
